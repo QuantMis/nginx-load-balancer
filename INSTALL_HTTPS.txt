@@ -1,0 +1,168 @@
+Commands to achieve HTTPS using docker_c-nginx-load-balancer_1. We use
+transparencycamp.eu as example domain. Certbot is already installed via
+docker-compose and available in the `docker_c-certbot_1` container.
+
+
+### Setup Let's Encrypt cron
+Let's Encrypt certificates are valid for 90 days. Add a cronjob to
+automatically check twice a day (on 11:27 and 23:27) if the certificates need
+to be renewed and renews them if needed. To do that, add
+the following line to `crontab` (using `sudo crontab -e`):
+27 11,23 * * * sudo docker exec docker_c-certbot_1 certbot renew && (cd /home/projects/nginx-load-balancer/docker && sudo ./reload.sh)
+
+
+### Retrieve a certificate
+First make sure the A and AAAA DNS records of the domain list the IP address
+of this server.
+
+(This step is only necessary if you retrieve the certificate using the
+HTTP method. Normally we use the DNS method.)
+In `docker/nginx/conf.d/default.conf` make sure that the server block contains
+the location block for `/.well-known/acme-challenge/`, e.g.:
+server {
+    listen 443;
+    server_name
+        transparencycamp.eu
+        www.transparencycamp.eu:
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html/;
+    }
+}
+Reload Nginx:
+   $ cd docker
+   $ ./reload.sh
+
+Now you can retrieve your certificate using either the DNS method (preferred,
+as this allows you to get a wildcard certificate) or the HTTP method:
+   # DNS method
+   $ sudo docker exec docker_c-certbot_1 certbot certonly --agree-tos -m developers@openstate.eu -d transparencycamp.eu -d *.transparencycamp.eu -a dns-transip --dns-transip-credentials transip.ini --dns-transip-propagation-seconds 240
+
+   # HTTP method
+   $ sudo docker exec docker_c-certbot_1 certbot certonly -m developers@openstate.eu --webroot --webroot-path /home/projects/html -d transparencycamp.eu -d www.transparencycamp.eu
+
+This gives the following output:
+IMPORTANT NOTES:
+ - Congratulations! Your certificate and chain have been saved at:
+   /etc/letsencrypt/live/transparencycamp.eu/fullchain.pem
+   Your key file has been saved at:
+   /etc/letsencrypt/live/transparencycamp.eu/privkey.pem
+   Your cert will expire on 2019-05-15. To obtain a new or tweaked
+   version of this certificate in the future, simply run certbot
+   again. To non-interactively renew *all* of your certificates, run
+   "certbot renew"
+
+
+### Install the certificate
+If this is the first certificate on the server you can now uncomment the top
+server block in docker/nginx/conf.d/default.conf to enable a default response
+for HTTPS requests.
+
+Edit docker/nginx/conf.d/default.conf
+NOTE: When editing default.conf using vim, make sure to add the following line
+to your ~/.vimrc file otherwise the container will not receive any changes you
+made to it! https://forums.docker.com/t/modify-a-file-which-mount-as-a-data-volume-but-it-didnt-change-in-container/2813/11:
+set backupcopy=yes
+
+You can now add the `ssl_certificate` and `ssl_certificate_key` lines to your
+`server` block (make sure the proxy_pass and ssl paths are correct! change '*'
+with 'www' if you don't use a wildcard certificate), e.g.:
+server {
+    listen 443 ssl http2;
+    server_name
+        transparencycamp.eu
+        *.transparencycamp.eu;
+    ssl_certificate /etc/letsencrypt/live/transparencycamp.eu/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/transparencycamp.eu/privkey.pem;
+
+    location / {
+        proxy_pass http://docker_c-nginx_1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # This block is only necessary if you retrieve the certificate using
+    # the HTTP method. Normally we use the DNS method.
+    location ^~ /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html/;
+    }
+}
+
+Note: add new SSL domains to the ssl-test monitor which runs a daily check on
+the domain using the SSL Labs SSL Server Test to see if something had changed
+(e.g., problems with the certificate or vulnarability to a new hack resulting
+in a lower grade). The file to add it to:
+Oxygen:/home/projects/ssl-test/check-ssl.py
+
+(optional but recommended) if you do not want the website to be reachable by
+both HTTP and HTTPS, but only via HTTPS:
+- Remove the domain from the HTTP section
+- Add the following block to force redirect from HTTP to HTTPS (change
+  '*' with 'www' if you don't use a wildcard certificate):
+server {
+    listen 80;
+    server_name
+        transparencycamp.eu
+        *.transparencycamp.eu;
+
+    return 301 https://$host$request_uri;
+}
+- Add this line which enables HSTS, to the SSL server section (e.g., add it
+below the `ssl_certificate_key` line):
+add_header Strict-Transport-Security max-age=31536000 always;
+
+Reload nginx:
+   $ cd docker
+   $ ./reload.sh
+
+
+### Migrate a certificate from one machine to another
+When moving a website it is best to migrate the certificate instead of creating
+a new one. The latter option is a bad idea because you first need to change the
+DNS to point to the new machine in order to retrieve a new certificate, which
+will result in failed HTTPS requests to the website because you don't have a
+certificate yet (especially when using HSTS). So here is the way to migrate
+a certificate:
+   # On the old machine
+   $ sudo cp -r --preserve=links /etc/letsencrypt ~
+   $ sudo chown -R <your_user_name>:<your_user_name> ~/letsencrypt
+   # Log out of the old machine and log into the new machine
+   $ rsync -av <IP_OF_OLD_MACHINE>:letsencrypt ~
+   $ sudo -i
+   $ cp -r /home/<your_user_name>/letsencrypt/archive/<domain> /etc/letsencrypt/archive
+   $ cp -r /home/<your_user_name>/letsencrypt/live/<domain> /etc/letsencrypt/live
+   $ cp /home/<your_user_name>/letsencrypt/renewal/<domain>.conf /etc/letsencrypt/renewal
+   # Make sure the settings in /etc/letsencrypt/renewal/<domain>.conf are correct.
+   # Check the .conf files of other certificates if the format has changed.
+   # Exit sudo and check if it works (NB: --no-random-sleep-on-renew doesn't
+   # work with dns-transip as we hardcode it to wait 240 seconds)
+   $ sudo docker exec docker_c-certbot_1 certbot renew --dry-run --no-random-sleep-on-renew
+   # Remove `~/letsencrypt` on the old and new machine
+   # Now follow the other steps above in the 'Install the certificate' section
+
+NB: you probably need to remove the /etc/letsencrypts/accounts folder as they don't seem to be transferable between servers; a new account will be recreated when requesting a new certificate; NOTE: if you do this then you need to change the account id in the configuration for all certficates (/etc/letsencrypt/renewal/*.conf)
+
+
+### Remove domain from certificate
+If a certificate contains multiple subdomains you sometimes want to remove one
+of those subdomains. Simply first delete the certificate and then regenerate
+the certificate without the subdomain, e.g.:
+   # Note: you can retrieve the cert-name using `sudo docker exec docker_c-certbot_1 certbot certificates` and check the value for 'Certificate Name'
+   $ sudo docker exec docker_c-certbot_1 certbot delete --cert-name transparencycamp.eu
+   # Then use the 'sudo docker exec docker_c-certbot_1 certbot certonly' as shown before in this document without the subdomain you want to remove
+
+
+### Create locally signed and locally trusted certificates for development
+Install [mkcert](https://blog.filippo.io/mkcert-valid-https-certificates-for-localhost/), this is easiest by downloading the latest [binary release](https://github.com/FiloSottile/mkcert/releases/) into the `docker/mkcert` directory (make it executable and rename the release to `mkcert`)
+
+Create a new local CA and install the CA in the system trust store and your browsers (requires restart of your browser!)
+   $ cd docker/mkcert
+   $ ./mkcert -install
+
+Example of generating certificates for openstate.eu
+   $ ./mkcert openstate.eu *.openstate.eu
+   $ mkdir openstate.eu
+   $ mv openstate.eu+1.pem openstate.eu/fullchain.pem
+   $ mv openstate.eu+1-key.pem openstate.eu/privkey.pem
